@@ -14,6 +14,7 @@ Collection: dewi_maklon_bom_templates
 Endpoint prefix: /api/dewi/maklon
 """
 from fastapi import APIRouter, HTTPException, Depends, Query
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -26,9 +27,7 @@ import uuid
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-BOM-Template'])
-
-
+router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-BOM-Template'], dependencies=[Depends(deny_external_dep)])
 def _uid() -> str:
     return str(uuid.uuid4())
 

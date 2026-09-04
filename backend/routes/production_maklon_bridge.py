@@ -32,6 +32,8 @@ PO_STATUS_TO_MAKLON = {
     'Ready to Close': 'completed',
     'Completed': 'completed',
     'Closed': 'completed',
+    'Closed Short': 'completed',
+    'Cancelled': 'cancelled',
 }
 
 
@@ -66,22 +68,44 @@ async def sync_po_to_maklon_finance(db, po_id: str, user: dict) -> dict:
         {'$group': {'_id': '$po_item_id', 'qty': {'$sum': '$produced_qty'}}},
     ]).to_list(None) if item_ids else []
     produced_by_item = {a['_id']: a['qty'] for a in prod_agg}
-    # Aggregate dispatched ke klien (buyer_shipment_items)
+    # Aggregate dispatched ke klien — HANYA surat jalan ke BUYER (deklarasi CMT→DA
+    # `receiver_type='da'` juga tersimpan di buyer_shipment_items; audit M-08).
+    buyer_ship_ids = await _buyer_shipment_ids_for_po(db, po_id)
     disp_agg = await db.buyer_shipment_items.aggregate([
-        {'$match': {'po_item_id': {'$in': item_ids}}},
+        {'$match': {'po_item_id': {'$in': item_ids}, 'shipment_id': {'$in': buyer_ship_ids}}},
         {'$group': {'_id': '$po_item_id', 'qty': {'$sum': '$qty_shipped'}}},
-    ]).to_list(None) if item_ids else []
+    ]).to_list(None) if (item_ids and buyer_ship_ids) else []
     dispatched_by_item = {a['_id']: a['qty'] for a in disp_agg}
+
+    existing = await db.dewi_maklon_pos.find_one({'id': po_id}, {'_id': 0})
+    ar_doc = None
+    if (existing or {}).get('ar_invoice_id'):
+        ar_doc = await db.rahaza_ar_invoices.find_one(
+            {'id': existing['ar_invoice_id'], 'source_module': 'maklon_po'}, {'_id': 0, 'status': 1})
+    if not ar_doc:
+        # invoice legacy (dewi_maklon_invoices tanpa tautan AR) juga berarti "sudah ditagih"
+        legacy_inv = await db.dewi_maklon_invoices.find_one(
+            {'order_id': po_id, 'status': {'$ne': 'cancelled'}}, {'_id': 0, 'status': 1})
+        if legacy_inv:
+            ar_doc = {'status': 'issued'}
 
     items = []
     total_qty = 0
     total_value = 0.0
+    total_cmt_cost = 0.0
     for idx, pi in enumerate(po_items, start=1):
         qty = int(pi.get('qty', 0) or 0)
-        rate = float(pi.get('cmt_price_snapshot', 0) or 0)
+        # Dua harga BERBEDA (keputusan pemilik 2026-09-03): `cmt_price_snapshot` = upah jahit
+        # vendor CMT (BIAYA, dasar AP), `selling_price_snapshot` = harga jasa ke klien
+        # (PENDAPATAN, dasar AR). Dulu AR memakai cmt_price ⇒ margin maklon selalu 0 (audit M-06).
+        cmt_rate = float(pi.get('cmt_price_snapshot', 0) or 0)
+        sell = float(pi.get('selling_price_snapshot', 0) or 0)
+        rate = sell if sell > 0 else cmt_rate
         subtotal = round(rate * qty, 2)
+        cmt_cost = round(cmt_rate * qty, 2)
         total_qty += qty
         total_value += subtotal
+        total_cmt_cost += cmt_cost
         items.append({
             'item_id': pi['id'],
             'idx': idx,
@@ -93,8 +117,11 @@ async def sync_po_to_maklon_finance(db, po_id: str, user: dict) -> dict:
             'qty': qty,
             'qty_produced': int(produced_by_item.get(pi['id'], 0) or 0),
             'qty_dispatched': int(dispatched_by_item.get(pi['id'], 0) or 0),
-            'cmt_rate_per_pcs': rate,
+            'cmt_rate_per_pcs': cmt_rate,
+            'selling_price_per_pcs': rate,
+            'price_basis': 'selling' if sell > 0 else 'cmt_fallback',
             'subtotal': subtotal,
+            'cmt_cost': cmt_cost,
             'product_description': pi.get('product_name', ''),
             'notes': '',
             'wo_id': None, 'wo_number': None,
@@ -107,13 +134,18 @@ async def sync_po_to_maklon_finance(db, po_id: str, user: dict) -> dict:
             'status': 'in_production' if produced_by_item.get(pi['id']) else 'pending',
         })
     total_value = round(total_value, 2)
+    total_cmt_cost = round(total_cmt_cost, 2)
 
     mirror_status = PO_STATUS_TO_MAKLON.get(po.get('status', 'Draft'), 'draft')
     total_dispatched = sum(i['qty_dispatched'] for i in items)
     if mirror_status == 'in_production' and total_dispatched > 0:
         mirror_status = 'partial_delivered'
+    # Invoice yang sudah TERBIT (bukan draft) menang atas status produksi — layar finance
+    # harus tetap melihat "Ditagih" walau PO baru saja ditutup (audit M-03/M-10).
+    if ar_doc and (ar_doc.get('status') or 'draft') not in ('draft', 'cancelled') \
+            and mirror_status != 'cancelled':
+        mirror_status = 'invoiced'
 
-    existing = await db.dewi_maklon_pos.find_one({'id': po_id}, {'_id': 0})
     if not existing:
         # Mirror basi dgn po_number sama (PO lama sudah dihapus) → bersihkan agar
         # unique index po_number tidak menolak insert.
@@ -135,6 +167,10 @@ async def sync_po_to_maklon_finance(db, po_id: str, user: dict) -> dict:
         'items': items,
         'total_qty': total_qty,
         'total_value': total_value,
+        'total_cmt_cost': total_cmt_cost,
+        'gross_margin': round(total_value - total_cmt_cost, 2),
+        'qty_dispatched': total_dispatched,
+        'qty_produced': sum(i['qty_produced'] for i in items),
         'notes': po.get('notes', ''),
         'mirror_of': 'production_pos',
         'production_po_id': po_id,
@@ -166,9 +202,9 @@ async def sync_po_to_maklon_finance(db, po_id: str, user: dict) -> dict:
         ar_invoice_id = new_id()
         lines = [{
             'line_id': new_id(),
-            'description': f"Jasa CMT — {it['artikel']} {it['color']} {it['size']} (Seri {it['seri_no']})".strip(),
+            'description': f"Jasa Maklon — {it['artikel']} {it['color']} {it['size']} (Seri {it['seri_no']})".strip(),
             'qty': it['qty'],
-            'unit_price': it['cmt_rate_per_pcs'],
+            'unit_price': it['selling_price_per_pcs'],
             'subtotal': it['subtotal'],
             'item_id': it['item_id'],
         } for it in items]
@@ -469,7 +505,10 @@ async def compute_po_fulfillment(db, po_id: str) -> dict:
     po_items = await db.po_items.find({'po_id': po_id}, {'_id': 0}).to_list(None)
     item_ids = [i['id'] for i in po_items]
     ordered_by_item = {i['id']: int(i.get('qty', 0) or 0) for i in po_items}
-    rate_by_item = {i['id']: float(i.get('cmt_price_snapshot', 0) or 0) for i in po_items}
+    # Harga jasa ke KLIEN (selling); `cmt_price_snapshot` adalah upah vendor, bukan harga tagihan.
+    rate_by_item = {
+        i['id']: float(i.get('selling_price_snapshot', 0) or 0) or float(i.get('cmt_price_snapshot', 0) or 0)
+        for i in po_items}
     total_ordered = sum(ordered_by_item.values())
 
     bs_ids = await _buyer_shipment_ids_for_po(db, po_id)
@@ -523,6 +562,32 @@ async def compute_po_fulfillment(db, po_id: str) -> dict:
         'received_by_item': received_by_item,
         'rate_by_item': rate_by_item,
     }
+
+
+async def billable_lines_for_po(db, po_id: str) -> dict:
+    """SATU rumus tagihan klien maklon: qty yang DITERIMA buyer per item × harga jasa (selling).
+    Dipakai `GET /invoices/eligible` (pratinjau) dan `POST /invoices/generate` (terbit) —
+    layar dan dokumen tidak boleh berbeda angka (audit M-04/M-05)."""
+    f = await compute_po_fulfillment(db, po_id)
+    po_items = await db.po_items.find({'po_id': po_id}, {'_id': 0}).sort('created_at', 1).to_list(None)
+    lines = []
+    subtotal = 0.0
+    for pi in po_items:
+        qty = int(f['received_by_item'].get(pi['id'], 0) or 0)
+        if qty <= 0:
+            continue
+        rate = float(f['rate_by_item'].get(pi['id'], 0) or 0)
+        sub = round(qty * rate, 2)
+        subtotal += sub
+        lines.append({
+            'line_id': new_id(), 'item_id': pi['id'], 'sku': pi.get('sku', ''),
+            'description': (f"Jasa Maklon — {pi.get('product_name', '')} {pi.get('color', '')} "
+                            f"{pi.get('size', '')} (Seri {pi.get('serial_number') or '-'})").strip(),
+            'qty': qty, 'qty_ordered': int(pi.get('qty', 0) or 0), 'unit': 'pcs',
+            'unit_price': rate, 'subtotal': sub, 'line_total': sub,
+        })
+    return {'lines': lines, 'subtotal': round(subtotal, 2),
+            'total_ordered': f['total_ordered'], 'total_received': f['total_received']}
 
 
 async def try_auto_close_po_on_full(db, po_id: str, user: dict) -> dict:

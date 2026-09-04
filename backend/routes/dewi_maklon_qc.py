@@ -6,6 +6,7 @@ Collections:
 - dewi_maklon_qc_checks: QC inspection records per maklon order stage
 """
 from fastapi import APIRouter, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -14,8 +15,7 @@ from auth import require_auth
 from routes._maklon_adapter import legacy_orders_view as _lmo
 import uuid
 
-router = APIRouter(prefix='/api/dewi/maklon/qc', tags=['Dewi-Maklon-QC'])
-
+router = APIRouter(prefix='/api/dewi/maklon/qc', tags=['Dewi-Maklon-QC'], dependencies=[Depends(deny_external_dep)])
 # ══════════════════════════════════════════════════════════════════════════════
 # MODELS
 # ══════════════════════════════════════════════════════════════════════════════

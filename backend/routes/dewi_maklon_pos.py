@@ -13,6 +13,7 @@ Collections:
 - dewi_maklon_material_receive : Penerimaan material dari klien
 """
 from fastapi import APIRouter, HTTPException, Depends, Query
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, date
@@ -30,9 +31,7 @@ import uuid
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-PO'])
-
-
+router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-PO'], dependencies=[Depends(deny_external_dep)])
 def _uid(): return str(uuid.uuid4())
 def _now(): return datetime.now(timezone.utc)
 

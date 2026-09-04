@@ -9,6 +9,7 @@ Collections:
 """
 import logging
 from fastapi import APIRouter, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta, date
@@ -21,8 +22,7 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-Billing'])
-
+router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-Billing'], dependencies=[Depends(deny_external_dep)])
 # ══════════════════════════════════════════════════════════════════════════════
 # MODELS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -142,7 +142,120 @@ async def _recalc_invoice(db, invoice_id: str) -> dict:
         'updated_at': datetime.now(timezone.utc),
     }
     await db.dewi_maklon_invoices.update_one({'id': invoice_id}, {'$set': update})
+    # SATU SUMBER INVOICE: dokumen layar Invoice adalah cermin AR otomatis (`rahaza_ar_invoices`,
+    # id sama). Pembayaran/pajak/status dirambatkan supaya Finance & Maklon membaca angka yang sama.
+    if inv.get('ar_invoice_id'):
+        ar_status = {'paid': 'paid', 'cancelled': 'cancelled', 'draft': 'draft'}.get(status, 'issued')
+        await db.rahaza_ar_invoices.update_one({'id': inv['ar_invoice_id']}, {'$set': {
+            'tax_pct': tax_pct, 'tax_amount': tax_amount, 'discount_amount': discount,
+            'subtotal': round(subtotal, 2), 'total_amount': total,
+            'amount_paid': paid, 'amount_due': balance, 'status': ar_status,
+            'updated_at': datetime.now(timezone.utc)}})
     return update
+
+
+async def _billable_preview(db, mirror: dict) -> dict:
+    from routes.production_maklon_bridge import billable_lines_for_po
+    bill = await billable_lines_for_po(db, mirror['id'])
+    return {
+        'id': mirror['id'], 'source': 'engine_ar', 'po_number': mirror.get('po_number'),
+        'order_code': mirror.get('po_number'), 'client_id': mirror.get('client_id'),
+        'client_name': mirror.get('client_name'), 'status': mirror.get('status'),
+        'ar_invoice_number': mirror.get('ar_invoice_number'),
+        'total_ordered': bill['total_ordered'], 'total_received': bill['total_received'],
+        'subtotal': bill['subtotal'], 'line_count': len(bill['lines']), 'lines': bill['lines'],
+        'billable': bool(bill['lines']),
+    }
+
+
+async def _generate_from_engine_ar(db, mirror: dict, payload: 'InvoiceGenerateIn', user: dict) -> dict:
+    """PO engine (mirror production_pos): TERBITKAN AR otomatis yang sudah ada — bukan
+    membuat dokumen/nomor kedua. Nomor = nomor AR; qty = yang diterima klien × harga jasa."""
+    from routes.production_maklon_bridge import billable_lines_for_po, try_sync_maklon_finance
+    po_id = mirror['id']
+    if mirror.get('status') in ('draft', 'cancelled'):
+        raise HTTPException(400, f"PO berstatus {mirror.get('status')} tidak bisa diinvoice")
+    existing = await db.dewi_maklon_invoices.find_one(
+        {'order_id': po_id, 'status': {'$ne': 'cancelled'}}, {'_id': 0, 'invoice_number': 1})
+    if existing:
+        raise HTTPException(400, f'PO sudah memiliki invoice {existing.get("invoice_number")}')
+    ar = None
+    if mirror.get('ar_invoice_id'):
+        ar = await db.rahaza_ar_invoices.find_one(
+            {'id': mirror['ar_invoice_id'], 'source_module': 'maklon_po'}, {'_id': 0})
+    if not ar:
+        await try_sync_maklon_finance(db, po_id, user)
+        m2 = await db.dewi_maklon_pos.find_one({'id': po_id}, {'_id': 0, 'ar_invoice_id': 1}) or {}
+        if m2.get('ar_invoice_id'):
+            ar = await db.rahaza_ar_invoices.find_one({'id': m2['ar_invoice_id']}, {'_id': 0})
+    if not ar:
+        raise HTTPException(400, 'AR otomatis belum terbentuk — PO harus sudah Confirmed')
+    if (ar.get('status') or 'draft') != 'draft':
+        raise HTTPException(400, f"AR {ar.get('invoice_number')} sudah berstatus {ar.get('status')}")
+    if (payload.invoice_number or '').strip() and payload.invoice_number.strip() != ar.get('invoice_number'):
+        raise HTTPException(400, f"Nomor invoice PO ini mengikuti AR otomatis {ar.get('invoice_number')} — "
+                                 'kosongkan kolom nomor.')
+    bill = await billable_lines_for_po(db, po_id)
+    if not bill['lines']:
+        raise HTTPException(400, 'Belum ada qty yang dikirim/diterima klien — tidak ada yang bisa ditagih')
+
+    tax_default = float(await get_config_value(db, 'maklon_tax_pct', 11.0) or 0)
+    term_default = await get_config_value(db, 'maklon_payment_terms_default', 'net_30') or 'net_30'
+    tax_pct = payload.tax_pct if payload.tax_pct is not None else tax_default
+    term = payload.payment_terms or term_default
+    issue = payload.issue_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    try:
+        issue_d = date.fromisoformat(issue)
+    except ValueError:
+        raise HTTPException(400, 'issue_date tidak valid (YYYY-MM-DD)')
+    due_d = issue_d + timedelta(days=_payment_term_days(term))
+    now = datetime.now(timezone.utc)
+    subtotal = bill['subtotal']
+    tax_amount = round(subtotal * tax_pct / 100, 2)
+    total = round(subtotal + tax_amount, 2)
+
+    await db.rahaza_ar_invoices.update_one({'id': ar['id']}, {'$set': {
+        'lines': bill['lines'], 'subtotal': subtotal, 'tax_pct': tax_pct, 'tax_amount': tax_amount,
+        'discount_amount': 0.0, 'total_amount': total, 'amount_paid': 0.0, 'amount_due': total,
+        'invoice_date': issue_d.isoformat(), 'due_date': due_d.isoformat(), 'payment_terms': term,
+        'status': 'issued', 'issued_at': now, 'issued_by': user.get('name', ''),
+        'billing_basis': 'received_qty_x_selling_price',
+        'notes': (payload.notes or ar.get('notes') or ''), 'updated_at': now}})
+    doc = {
+        'id': ar['id'], 'invoice_number': ar['invoice_number'], 'ar_invoice_id': ar['id'],
+        'source': 'engine_ar', 'order_id': po_id, 'order_code': mirror.get('po_number'),
+        'po_id': po_id, 'po_number': mirror.get('po_number'),
+        'client_id': mirror.get('client_id'), 'client_name': mirror.get('client_name'),
+        'issue_date': issue_d.isoformat(), 'due_date': due_d.isoformat(), 'payment_terms': term,
+        'tax_pct': tax_pct, 'discount_amount': 0.0,
+        'lines': [{'description': ln['description'], 'qty': ln['qty'], 'unit': 'pcs',
+                   'unit_price': ln['unit_price'], 'line_total': ln['line_total'],
+                   'item_id': ln['item_id'], 'sku': ln['sku'], 'qty_ordered': ln['qty_ordered']}
+                  for ln in bill['lines']],
+        'subtotal': subtotal, 'tax_amount': 0.0, 'total_amount': 0.0, 'paid_amount': 0.0,
+        'balance_amount': 0.0, 'status': 'issued', 'notes': payload.notes,
+        'created_at': now, 'updated_at': now, 'created_by': user.get('name', 'System'),
+    }
+    await db.dewi_maklon_invoices.insert_one(doc)
+    await db.dewi_maklon_pos.update_one({'id': po_id}, {'$set': {
+        'status': 'invoiced', 'ar_invoice_id': ar['id'], 'ar_invoice_number': ar['invoice_number'],
+        'updated_at': now}})
+    await _recalc_invoice(db, doc['id'])
+    await _notify_client_invoice(db, doc, mirror.get('po_number'))
+    return _clean(await db.dewi_maklon_invoices.find_one({'id': doc['id']}))
+
+
+async def _notify_client_invoice(db, doc: dict, order_code: str):
+    try:
+        from routes.dewi_notifications import queue_for_client
+        body = (f"Invoice baru {doc.get('invoice_number')} untuk order {order_code} telah diterbitkan. "
+                f"Total Rp {int(doc.get('total_amount') or 0):,}, jatuh tempo {doc.get('due_date')}.").replace(',', '.')
+        await queue_for_client(db, client_id=doc.get('client_id'),
+                               subject=f"Invoice baru — {doc.get('invoice_number')}", body=body,
+                               event_type='invoice_issued', source_ref=doc['id'],
+                               meta={'invoice_number': doc.get('invoice_number'), 'total': doc.get('total_amount')})
+    except Exception:
+        logging.getLogger(__name__).debug("suppressed exception", exc_info=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INVOICE ROUTES
@@ -174,6 +287,31 @@ async def list_invoices(
         query['issue_date'] = rng
     items = await db.dewi_maklon_invoices.find(query).sort('issue_date', -1).to_list(length=500)
     return [_clean(i) for i in items]
+
+@router.get('/invoices/eligible')
+async def list_eligible_for_invoice(user: dict = Depends(require_auth)):
+    """PO yang bisa ditagih: mirror engine (AR otomatis, qty diterima × harga jasa) + PO legacy
+    tanpa mirror. Satu daftar untuk dialog Generate supaya angka pratinjau = angka dokumen."""
+    db = get_db()
+    invoiced = set(await db.dewi_maklon_invoices.distinct('order_id', {'status': {'$ne': 'cancelled'}}))
+    out = []
+    async for po in db.dewi_maklon_pos.find(
+            {'status': {'$nin': ['draft', 'cancelled', 'invoiced']}}, {'_id': 0}).sort('created_at', -1):
+        if po['id'] in invoiced:
+            continue
+        if po.get('mirror_of') == 'production_pos':
+            out.append(await _billable_preview(db, po))
+        else:
+            legacy = po_to_legacy_order(po)
+            qty = int(legacy.get('qty_ordered', 0) or 0)
+            price = float(legacy.get('price_per_pcs', 0) or 0)
+            out.append({'id': po['id'], 'source': 'legacy', 'po_number': po.get('po_number'),
+                        'order_code': legacy.get('order_code'), 'client_id': po.get('client_id'),
+                        'client_name': po.get('client_name'), 'status': po.get('status'),
+                        'ar_invoice_number': None, 'total_ordered': qty, 'total_received': qty,
+                        'subtotal': round(qty * price, 2), 'line_count': 1, 'lines': [], 'billable': qty > 0})
+    return out
+
 
 @router.get('/invoices/{invoice_id}')
 async def get_invoice(invoice_id: str, user: dict = Depends(require_auth)):
@@ -223,6 +361,8 @@ async def generate_invoice(payload: InvoiceGenerateIn, user: dict = Depends(requ
     if not rec:
         raise HTTPException(404, 'Order tidak ditemukan')
     is_po = rec.get('_collection') == 'dewi_maklon_pos'
+    if is_po and rec.get('mirror_of') == 'production_pos':
+        return await _generate_from_engine_ar(db, rec, payload, user)
     # Normalize to legacy order shape for the rest of the flow
     order = po_to_legacy_order(rec) if is_po else rec
     order_id_canonical = order.get('id')
@@ -348,6 +488,14 @@ async def cancel_invoice(invoice_id: str, user: dict = Depends(require_auth)):
         raise HTTPException(404, 'Invoice tidak ditemukan')
     if inv.get('paid_amount', 0) > 0:
         raise HTTPException(400, 'Invoice yang sudah dibayar tidak bisa dibatalkan')
+    if inv.get('ar_invoice_id'):
+        ar = await db.rahaza_ar_invoices.find_one({'id': inv['ar_invoice_id']}, {'_id': 0, 'gl_posted_at': 1}) or {}
+        if ar.get('gl_posted_at'):
+            raise HTTPException(400, 'Invoice sudah diposting ke GL — batalkan lewat nota kredit, bukan cancel')
+        # AR kembali menjadi draft supaya bisa diterbitkan ulang dengan qty terbaru.
+        await db.rahaza_ar_invoices.update_one({'id': inv['ar_invoice_id']}, {'$set': {
+            'status': 'draft', 'amount_paid': 0.0, 'issued_at': None,
+            'updated_at': datetime.now(timezone.utc)}})
     await db.dewi_maklon_invoices.update_one(
         {'id': invoice_id},
         {'$set': {'status': 'cancelled', 'updated_at': datetime.now(timezone.utc)}}

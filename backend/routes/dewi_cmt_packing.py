@@ -27,7 +27,8 @@ Endpoints:
 """
 # ruff: noqa: E741
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
+from routes.production_rbac import deny_external_dep
 from fastapi.responses import JSONResponse
 import uuid
 import re
@@ -98,8 +99,7 @@ async def _ensure_fg_for_cmt_line(db, ln: dict, doc: dict, user: dict) -> dict:
     await db.rahaza_materials.insert_one(dict(fg))
     return fg
 
-router = APIRouter(prefix="/api/prod", tags=["cmt-packing"])
-
+router = APIRouter(prefix="/api/prod", tags=["cmt-packing"], dependencies=[Depends(deny_external_dep)])
 def _id():  return str(uuid.uuid4())
 def _now(): return datetime.now(timezone.utc).isoformat()
 

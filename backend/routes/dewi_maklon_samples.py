@@ -8,6 +8,7 @@ Collections:
 """
 import logging
 from fastapi import APIRouter, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -16,8 +17,7 @@ from auth import require_auth
 from routes._maklon_adapter import find_maklon_record, po_to_legacy_order
 import uuid
 
-router = APIRouter(prefix='/api/dewi/maklon/samples', tags=['Dewi-Maklon-Samples'])
-
+router = APIRouter(prefix='/api/dewi/maklon/samples', tags=['Dewi-Maklon-Samples'], dependencies=[Depends(deny_external_dep)])
 # ══════════════════════════════════════════════════════════════════════════════
 # MODELS
 # ══════════════════════════════════════════════════════════════════════════════

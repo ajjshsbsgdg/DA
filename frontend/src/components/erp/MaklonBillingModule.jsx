@@ -49,22 +49,16 @@ export default function MaklonBillingModule({ token, onNavigate }) {
   const fetchAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [inv, ord, sum, ag] = await Promise.all([
+      const [inv, elig, sum, ag] = await Promise.all([
         fetch('/api/dewi/maklon/invoices', { headers }),
-        fetch('/api/dewi/maklon/pos', { headers }),
+        fetch('/api/dewi/maklon/invoices/eligible', { headers }),
         fetch('/api/dewi/maklon/reports/billing-summary', { headers }),
         fetch('/api/dewi/maklon/reports/aging', { headers }),
       ]);
       if (inv.ok) setInvoices(await inv.json());
-      if (ord.ok) {
-        const allOrders = posToLegacyOrders(await ord.json());
-        // Orders that can be invoiced: not draft/cancelled, not already invoiced (we verify via invoices list)
-        const invoicedOrderIds = new Set((await (await fetch('/api/dewi/maklon/invoices', { headers })).json() || [])
-          .filter(x => x.status !== 'cancelled').map(x => x.order_id));
-        setEligibleOrders(allOrders.filter(o =>
-          !['draft','cancelled'].includes(o.status) && !invoicedOrderIds.has(o.id)
-        ));
-      }
+      // SATU SUMBER: daftar PO yang bisa ditagih + pratinjau qty/nilai dihitung server
+      // (rumus yang sama dengan dokumen yang terbit) — bukan ditebak di browser.
+      if (elig.ok) setEligibleOrders(await elig.json());
       if (sum.ok) setSummary(await sum.json());
       if (ag.ok) setAging(await ag.json());
     } catch (e) { toast.error('Gagal memuat data billing'); }
@@ -275,15 +269,16 @@ function GenerateDialog({ orders, headers, onClose, onSuccess }) {
   const numPolicy = useDocNumberPolicy('dewi_maklon_invoices.invoice_number',
                                        localStorage.getItem('erp_token'));
   const [invNumber, setInvNumber] = useState('');
+  const selected = orders.find(o => o.id === orderId);
 
   const gen = async () => {
-    if (!orderId) { toast.error('Pilih order'); return; }
+    if (!orderId) { toast.error('Pilih PO'); return; }
     setSaving(true);
     const payload = { order_id: orderId };
     if (taxPct) payload.tax_pct = Number(taxPct);
     if (terms) payload.payment_terms = terms;
     if (notes) payload.notes = notes;
-    Object.assign(payload, docNumberPayload(numPolicy, 'invoice_number', invNumber));
+    if (selected?.source !== 'engine_ar') Object.assign(payload, docNumberPayload(numPolicy, 'invoice_number', invNumber));
     const r = await fetch('/api/dewi/maklon/invoices/generate', { method: 'POST', headers, body: JSON.stringify(payload) });
     setSaving(false);
     if (r.ok) {
@@ -310,13 +305,22 @@ function GenerateDialog({ orders, headers, onClose, onSuccess }) {
               <div className="space-y-1">
                 <Label>Order *</Label>
                 <Select value={orderId} onValueChange={setOrderId}>
-                  <SelectTrigger data-testid="gen-order-select"><SelectValue placeholder="Pilih order..." /></SelectTrigger>
+                  <SelectTrigger data-testid="gen-order-select"><SelectValue placeholder="Pilih PO..." /></SelectTrigger>
                   <SelectContent>
                     {orders.map(o => (
-                      <SelectItem key={o.id} value={o.id}>{o.order_code} — {o.product_name} ({o.qty_ordered}pcs @ Rp{o.price_per_pcs})</SelectItem>
+                      <SelectItem key={o.id} value={o.id} disabled={!o.billable}>
+                        {o.po_number} — {o.client_name} · terkirim {o.total_received}/{o.total_ordered} pcs · Rp {Number(o.subtotal || 0).toLocaleString('id-ID')}
+                        {!o.billable ? ' (belum ada kiriman)' : ''}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+                {selected?.source === 'engine_ar' && (
+                  <p className="text-xs text-muted-foreground" data-testid="gen-engine-ar-note">
+                    Menerbitkan AR otomatis <b>{selected.ar_invoice_number}</b>: {selected.line_count} baris,
+                    qty = yang diterima klien × harga jasa (selling price). Nomor mengikuti AR — tidak dibuat nomor baru.
+                  </p>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1"><Label>PPN % (opsional)</Label><Input type="number" placeholder="default config" value={taxPct} onChange={e => setTaxPct(e.target.value)} /></div>
@@ -334,9 +338,11 @@ function GenerateDialog({ orders, headers, onClose, onSuccess }) {
                 </div>
               </div>
               <div className="space-y-1"><Label>Catatan</Label><Textarea rows={2} value={notes} onChange={e => setNotes(e.target.value)} /></div>
-              <DocNumberField
-                policy={numPolicy} value={invNumber} onChange={setInvNumber}
-                testId="maklon-inv-docnum" label="Nomor Invoice" />
+              {selected?.source !== 'engine_ar' && (
+                <DocNumberField
+                  policy={numPolicy} value={invNumber} onChange={setInvNumber}
+                  testId="maklon-inv-docnum" label="Nomor Invoice" />
+              )}
             </>
           )}
         </div>

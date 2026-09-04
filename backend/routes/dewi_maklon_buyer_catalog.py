@@ -14,6 +14,7 @@ Collection: dewi_maklon_buyer_catalog
 Endpoint prefix: /api/dewi/maklon
 """
 from fastapi import APIRouter, HTTPException, Depends, Query, Request, UploadFile, File
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime, timezone
@@ -26,9 +27,7 @@ import io
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-Buyer-Catalog'])
-
-
+router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-Buyer-Catalog'], dependencies=[Depends(deny_external_dep)])
 def _uid() -> str:
     return str(uuid.uuid4())
 

@@ -14,6 +14,7 @@ Non-breaking: existing per-module endpoints are unchanged.
 """
 
 from fastapi import APIRouter, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 from typing import List, Dict, Any
 from datetime import datetime, timezone
 from database import get_db
@@ -22,9 +23,7 @@ from services.maklon_progress import compute_po_progress
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-360'])
-
-
+router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon-360'], dependencies=[Depends(deny_external_dep)])
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────

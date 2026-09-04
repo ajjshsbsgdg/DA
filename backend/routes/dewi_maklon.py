@@ -14,6 +14,7 @@ Collections:
                          management tools) now read from dewi_maklon_pos.
 """
 from fastapi import APIRouter, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict
 from datetime import datetime, timezone
@@ -27,9 +28,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon'])
-
-
+router = APIRouter(prefix='/api/dewi/maklon', tags=['Dewi-Maklon'], dependencies=[Depends(deny_external_dep)])
 # ─── STAGE CONFIG ────────────────────────────────────────────────────────────
 # Urutan stage produksi maklon
 STAGES_ORDER = ['draft', 'confirmed', 'material_ready', 'cutting', 'sewing', 'qc', 'packing', 'completed', 'invoiced']

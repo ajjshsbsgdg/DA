@@ -604,6 +604,9 @@ async def close_po(po_id: str, request: Request):
         'close_notes': body.get('close_notes', ''), 'closed_by': user['name'],
         'closed_at': now(), 'updated_at': now()
     }})
+    if po.get('business_type') == 'maklon':
+        from routes.production_maklon_bridge import try_sync_maklon_finance
+        await try_sync_maklon_finance(db, po_id, user)
     await log_activity(user['id'], user['name'], 'Close PO', 'Production PO', f"Closed PO: {po.get('po_number')}")
     return {'success': True}
 
@@ -658,6 +661,11 @@ async def close_po_short(po_id: str, request: Request):
         'status_before_close_short': po.get('status'),
         'updated_at': now(),
     }})
+    # Mirror finance dulu (status/qty), baru penyesuaian AR — supaya total_value mirror
+    # tidak menimpa hasil penyesuaian close-short (audit M-03).
+    if po.get('business_type') == 'maklon':
+        from routes.production_maklon_bridge import try_sync_maklon_finance
+        await try_sync_maklon_finance(db, po_id, user)
     finance = await finalize_ar_on_short_close(db, po, user, f)
     # GAP G — selisih yang masih terbuka harus terlihat saat PO ditutup supaya
     # keputusan tanggungan (CMT / DA) tidak terlewat.

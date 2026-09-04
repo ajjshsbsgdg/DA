@@ -23,14 +23,14 @@ import uuid
 import logging
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Request, HTTPException, Query
+from fastapi import APIRouter, Request, HTTPException, Query, Depends
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from database import get_db
 from auth import require_auth
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/maklon/ai-quote", tags=["maklon-ai-quote"])
-
+router = APIRouter(prefix="/api/maklon/ai-quote", tags=["maklon-ai-quote"], dependencies=[Depends(deny_external_dep)])
 QUOTE_COL = "rahaza_maklon_quotes"
 LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 LLM_MODEL = ("openai", "gpt-5.1")

@@ -10,7 +10,7 @@ Master data resolution (F-2 = Option A, satu engine):
   vendor_id → `garments` (SOMMERVILLE master) ATAU `vendor_partners` (CMT vendor DA)
   buyer_id  → `buyers` (SOMMERVILLE master) ATAU `dewi_maklon_clients` (klien maklon DA)
 """
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 PROD_ADMIN_ROLES = [
     'admin', 'admin_maklon', 'admin_produksi',
@@ -31,6 +31,27 @@ def vendor_identity(user: dict):
     """Vendor entity id for the logged-in vendor user (SOMMERVILLE vendor_id
     or DA cmt_vendor_id → vendor_partners.id)."""
     return user.get('vendor_id') or user.get('cmt_vendor_id')
+
+
+EXTERNAL_ROLES = ('klien_maklon',) + tuple(PROD_VENDOR_ROLES)
+# Vendor CMT masih boleh membaca daftar selisih kirim miliknya (endpoint sudah ter-scope vendor).
+_VENDOR_ALLOWED_PATHS = ('/api/prod/short-shipments',)
+
+
+async def deny_external_dep(request: Request):
+    """Dependency router: klien maklon & vendor CMT TIDAK boleh menyentuh endpoint admin
+    maklon (`/api/dewi/maklon/*`, `/api/prod/cmt-receipts*`, tagihan CMT). Klien memakai
+    `/api/maklon-client/*`, vendor memakai engine yang ter-scope `vendor_id` (audit M-01/M-02)."""
+    from auth import require_auth
+    user = await require_auth(request)
+    role = user.get('role') or ''
+    if role in EXTERNAL_ROLES:
+        if role in PROD_VENDOR_ROLES and request.method == 'GET' \
+                and request.url.path.rstrip('/') in _VENDOR_ALLOWED_PATHS:
+            return user
+        raise HTTPException(403, 'Akses ditolak: endpoint ini khusus staf DA. Klien memakai '
+                                 '/api/maklon-client/*, vendor CMT memakai portal vendor.')
+    return user
 
 
 def deny_klien(user: dict):

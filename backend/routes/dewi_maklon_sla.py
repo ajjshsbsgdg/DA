@@ -7,16 +7,15 @@ Session 13 — P1-9: Client SLA Dashboard + P1-10: Smart Lead Time Calculator
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from fastapi import APIRouter, Request, Query, HTTPException
+from fastapi import APIRouter, Request, Query, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from database import get_db
 from auth import require_auth
 from routes._maklon_adapter import legacy_orders_view as _lmo
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/maklon/sla", tags=["maklon-sla"])
-
-
+router = APIRouter(prefix="/api/maklon/sla", tags=["maklon-sla"], dependencies=[Depends(deny_external_dep)])
 def _now():
     return datetime.now(timezone.utc)
 

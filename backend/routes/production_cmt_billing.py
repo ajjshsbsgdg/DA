@@ -22,7 +22,8 @@ INTERNAL, Portal Maklon hanya domain MAKLON.
     - punya `job_ids`→ CMT-flow (DA menjahitkan produk DA sendiri) ⇒ INTERNAL
     - keduanya kosong→ 'unknown' (hanya muncul saat scope=all)
 """
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 
 from database import get_db
 from auth import require_auth, serialize_doc
@@ -30,8 +31,7 @@ from core import cmt_vendor_master
 from routes.production_rbac import deny_klien
 from core.pagination import _paginate_params, _paginated_envelope
 
-router = APIRouter(prefix="/api/production/cmt-billing", tags=["production-cmt-billing"])
-
+router = APIRouter(prefix="/api/production/cmt-billing", tags=["production-cmt-billing"], dependencies=[Depends(deny_external_dep)])
 # status yang dianggap masih menjadi kewajiban (outstanding)
 _OPEN_STATUS = ('draft', 'submitted', 'approved', 'pending')
 

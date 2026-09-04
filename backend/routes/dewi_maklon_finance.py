@@ -15,6 +15,7 @@ Endpoints:
   POST /api/dewi/cmt/payments/{payment_id}/post-ap   → Post CMT AP ke GL
 """
 from fastapi import APIRouter, HTTPException, Depends
+from routes.production_rbac import deny_external_dep
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timezone, date
@@ -26,9 +27,7 @@ import uuid
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix='/api/dewi/maklon/finance', tags=['Dewi-Maklon-Finance'])
-
-
+router = APIRouter(prefix='/api/dewi/maklon/finance', tags=['Dewi-Maklon-Finance'], dependencies=[Depends(deny_external_dep)])
 def _uid(): return str(uuid.uuid4())
 def _now(): return datetime.now(timezone.utc)
 
@@ -60,9 +59,10 @@ async def post_maklon_ar_invoice(db, po: dict, user: dict) -> dict:
     if not mapping:
         return {'ok': False, 'error': 'Posting profile maklon_ar_invoice tidak ditemukan'}
 
-    total = po.get('total_value', 0)
-    tax_pct = 0.0  # bisa dikonfigurasi nanti
-    tax_amount = round(total * tax_pct / 100, 2)
+    # Nilai jurnal = dokumen AR (qty diterima × harga jasa + PPN) — bukan nilai order mirror.
+    ar_doc = await db.rahaza_ar_invoices.find_one({'id': ar_invoice_id}, {'_id': 0}) or {}
+    total = float(ar_doc.get('total_amount') if ar_doc.get('total_amount') is not None else po.get('total_value', 0) or 0)
+    tax_amount = round(float(ar_doc.get('tax_amount') or 0), 2)
     revenue_amount = round(total - tax_amount, 2)
 
     lines = [
